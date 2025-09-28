@@ -1,12 +1,17 @@
 import { Image } from 'expo-image';
-import { StyleSheet, View, Text, Dimensions, Pressable, Modal, FlatList, Animated } from 'react-native';
+import { StyleSheet, View, Text, Dimensions, Pressable, Modal, FlatList, Animated, Alert } from 'react-native';
 import { Link, router } from 'expo-router';
 import { useTripStore } from '@/hooks/use-trip-store';
-import MapView, { Marker, PROVIDER_DEFAULT, Region } from 'react-native-maps';
-import { useMemo, useRef, useState } from 'react';
+import MapView, { Marker, Polyline, PROVIDER_DEFAULT, Region } from 'react-native-maps';
+import { useMemo, useRef, useState, useCallback } from 'react';
 import { useMediaStore } from '@/hooks/use-media-store';
 import { useDebouncedClusters } from '@/hooks/use-debounced-clusters';
 import { DiaporamaModal } from '@/components/diaporama-modal';
+import { useThemeColor } from '@/hooks/use-theme-color';
+import { useAppTheme } from '@/hooks/use-app-theme';
+import { GlassView, isLiquidGlassAvailable } from 'expo-glass-effect';
+import * as ImagePicker from 'expo-image-picker';
+import * as MediaLibrary from 'expo-media-library';
 import type { MediaItem } from '@/components/types';
 
 export default function HomeScreen() {
@@ -16,9 +21,68 @@ export default function HomeScreen() {
   const [zoom, setZoom] = useState<number>(3);
   const [showListView, setShowListView] = useState(false);
   const [showDiaporama, setShowDiaporama] = useState(false);
+  const [showTripEdit, setShowTripEdit] = useState(false);
   const [diaporamaMedia, setDiaporamaMedia] = useState<MediaItem[]>([]);
   const [selectedTripId, setSelectedTripId] = useState<string | null>(null);
+  const [polylineUpdateKey, setPolylineUpdateKey] = useState(0);
+  const [clusterUpdateKey, setClusterUpdateKey] = useState(0);
   const slideAnim = useRef(new Animated.Value(-300)).current;
+
+  // Theme colors using the new comprehensive theme system
+  const theme = useAppTheme();
+  const textColor = theme.colors.text;
+  const backgroundColor = theme.colors.background;
+  const borderColor = theme.colors.border;
+  const cardBackgroundColor = theme.colors.backgroundSecondary;
+  const selectedCardBackgroundColor = theme.colors.primaryLight;
+  const headerBackgroundColor = theme.colors.glassBackground;
+  const toggleBackgroundColor = theme.colors.glassBackground;
+  const secondaryTextColor = theme.colors.textSecondary;
+
+  // Glass effect availability
+  const isGlassAvailable = isLiquidGlassAvailable();
+
+  // Dynamic styles with theme colors
+  const dynamicStyles = {
+    clusterBadge: {
+      ...styles.clusterBadge,
+      backgroundColor: theme.colors.primary,
+      shadowColor: theme.colors.shadow,
+    },
+    fab: {
+      ...styles.fab,
+      backgroundColor: theme.colors.primary,
+      shadowColor: theme.colors.shadow,
+    },
+    tripEditBtn: {
+      ...styles.tripEditBtn,
+      backgroundColor: 'transparent', // Let glass effect show through
+    },
+    tripClearBtn: {
+      ...styles.tripClearBtn,
+      backgroundColor: 'transparent', // Let glass effect show through
+    },
+    tripCardSelected: {
+      ...styles.tripCardSelected,
+      borderColor: theme.colors.primary,
+    },
+    tripCount: {
+      ...styles.tripCount,
+      color: theme.colors.primary,
+    },
+    primary: {
+      ...styles.primary,
+      backgroundColor: theme.colors.primary,
+    },
+    danger: {
+      ...styles.danger,
+      backgroundColor: theme.colors.danger,
+    },
+    tripEditGridItem: {
+      ...styles.tripEditGridItem,
+      backgroundColor: theme.colors.backgroundTertiary,
+    },
+  };
 
   const deriveZoom = (r: Region) => {
     const angle = r.longitudeDelta;
@@ -30,7 +94,7 @@ export default function HomeScreen() {
   const filteredMedia = useMemo(() => {
     if (!selectedTripId) return media;
     return media.filter(m => m.tripId === selectedTripId);
-  }, [media, selectedTripId]);
+  }, [media, selectedTripId, clusterUpdateKey]);
 
   // Use debounced clustering for better performance
   const { clusters, supercluster } = useDebouncedClusters({
@@ -45,6 +109,11 @@ export default function HomeScreen() {
   const { width, height } = Dimensions.get('window');
   const aspect = width / height;
   const trips = useTripStore((s) => s.trips);
+  const addMediaToTrip = useTripStore((s) => s.addMediaToTrip);
+  const removeMediaFromTrip = useTripStore((s) => s.removeMediaFromTrip);
+  const deleteTrip = useTripStore((s) => s.deleteTrip);
+  const upsertMany = useMediaStore((s) => s.upsertMany);
+  const removeMedia = useMediaStore((s) => s.removeMedia);
   const selectedTrip = useMemo(() => trips.find(t => t.id === selectedTripId) ?? null, [trips, selectedTripId]);
   const selectedTripDates = useMemo(() => {
     if (!selectedTrip) return null;
@@ -53,6 +122,88 @@ export default function HomeScreen() {
     if (!times.length) return null;
     return { start: new Date(times[0]), end: new Date(times[times.length - 1]) };
   }, [selectedTrip, media]);
+
+  // Calculate trip polylines based on zoom level and clusters
+  const tripPolylines = useMemo(() => {
+    if (!region) return [];
+
+    // Get trips to process - either selected trip or all trips
+    const tripsToProcess = selectedTrip ? [selectedTrip] : trips;
+    const allPolylines: { coordinates: { latitude: number; longitude: number }[]; tripId: string }[] = [];
+
+    tripsToProcess.forEach(trip => {
+      // Skip if trip is null or undefined (defensive programming)
+      if (!trip || !trip.id) return;
+
+      // Ensure the trip still exists in the trips array (defensive against race conditions)
+      if (!trips.find(t => t.id === trip.id)) return;
+
+      // Filter media that belongs to this specific trip
+      const tripMedia = media.filter(m => trip.mediaIds.includes(m.id));
+      const mediaWithLocation = tripMedia.filter(m => m.latitude != null && m.longitude != null);
+
+
+      if (mediaWithLocation.length < 2) return;
+
+      // Sort by creation time to get chronological order
+      const sortedMedia = mediaWithLocation.sort((a, b) => (a.creationTime ?? 0) - (b.creationTime ?? 0));
+
+      // Determine polyline strategy based on zoom level
+      const shouldShowClusters = zoom < 10; // Show clusters when zoomed out
+      const shouldShowIndividual = zoom >= 10; // Show individual points when zoomed in
+
+      let coordinates: { latitude: number; longitude: number }[] = [];
+
+      if (shouldShowClusters) {
+        // Group nearby points into clusters for the polyline
+        const clusterRadius = 0.01; // Adjust based on zoom level
+        const clusters: { lat: number; lng: number; media: typeof sortedMedia }[] = [];
+
+        sortedMedia.forEach(media => {
+          const lat = media.latitude!;
+          const lng = media.longitude!;
+
+          // Find existing cluster within radius
+          let foundCluster = false;
+          for (const cluster of clusters) {
+            const distance = Math.sqrt(
+              Math.pow(lat - cluster.lat, 2) + Math.pow(lng - cluster.lng, 2)
+            );
+            if (distance < clusterRadius) {
+              cluster.media.push(media);
+              // Update cluster center to average position
+              cluster.lat = (cluster.lat * (cluster.media.length - 1) + lat) / cluster.media.length;
+              cluster.lng = (cluster.lng * (cluster.media.length - 1) + lng) / cluster.media.length;
+              foundCluster = true;
+              break;
+            }
+          }
+
+          if (!foundCluster) {
+            clusters.push({ lat, lng, media: [media] });
+          }
+        });
+
+        // Create polyline coordinates from clusters
+        coordinates = clusters.map(cluster => ({
+          latitude: cluster.lat,
+          longitude: cluster.lng
+        }));
+      } else {
+        // Show individual points
+        coordinates = sortedMedia.map(media => ({
+          latitude: media.latitude!,
+          longitude: media.longitude!
+        }));
+      }
+
+      if (coordinates.length > 1) {
+        allPolylines.push({ coordinates, tripId: trip.id });
+      }
+    });
+
+    return allPolylines;
+  }, [selectedTrip, trips, media, region, zoom, polylineUpdateKey]);
 
   const trySelectTripForCluster = (clusterId: string) => {
     // With trip-separated clustering, we can directly extract the trip ID from the cluster ID
@@ -154,10 +305,167 @@ export default function HomeScreen() {
     }
   };
 
+  const openDiaporamaForMedia = (media: MediaItem) => {
+    // For single media items, create a single-item array for the diaporama
+    setDiaporamaMedia([media]);
+    setShowDiaporama(true);
+  };
+
+  const selectTrip = (tripId: string) => {
+    setSelectedTripId(tripId);
+  };
+
   const closeDiaporama = () => {
     setShowDiaporama(false);
+
+    // Auto-select the trip after viewing pictures
+    if (diaporamaMedia.length > 0 && diaporamaMedia[0].tripId) {
+      selectTrip(diaporamaMedia[0].tripId);
+    }
+
     setDiaporamaMedia([]);
   };
+
+  const openTripEdit = () => {
+    setShowTripEdit(true);
+  };
+
+  const closeTripEdit = () => {
+    setShowTripEdit(false);
+  };
+
+  const extractGpsFromExif = (exif: Record<string, any> | undefined | null) => {
+    if (!exif) return { latitude: null, longitude: null };
+    const lat = exif.GPSLatitude ?? exif.gpsLatitude ?? null;
+    const lon = exif.GPSLongitude ?? exif.gpsLongitude ?? null;
+    const latRef = exif.GPSLatitudeRef;
+    const lonRef = exif.GPSLongitudeRef;
+    const normalize = (value: any, ref?: string) => {
+      if (value == null) return null;
+      if (Array.isArray(value)) {
+        const [d, m, s] = value;
+        const decimal = Number(d) + Number(m) / 60 + Number(s) / 3600;
+        return (ref === 'S' || ref === 'W') ? -decimal : decimal;
+      }
+      const num = Number(value);
+      if (isNaN(num)) return null;
+      return (ref === 'S' || ref === 'W') ? -num : num;
+    };
+    return { latitude: normalize(lat, latRef), longitude: normalize(lon, lonRef) };
+  };
+
+  const addPhotosToTrip = useCallback(async () => {
+    if (!selectedTripId) return;
+
+    const mediaPerm = await MediaLibrary.requestPermissionsAsync();
+    const pickPerm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!(mediaPerm.status === 'granted' && pickPerm.status === 'granted')) {
+      Alert.alert('Permissions required');
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      allowsMultipleSelection: true,
+      mediaTypes: ['images'],
+      exif: true,
+      selectionLimit: 0,
+      quality: 0.7
+    });
+
+    if (result.canceled) return;
+
+    const enriched: MediaItem[] = await Promise.all(result.assets.map(async (a) => {
+      let latitude: number | null = null;
+      let longitude: number | null = null;
+      let creationTime: number | null | undefined = null;
+
+      if (a.assetId) {
+        try {
+          const info = await MediaLibrary.getAssetInfoAsync(a.assetId);
+          if (info && (info as any).location) {
+            const loc = (info as any).location;
+            latitude = typeof loc.latitude === 'number' ? loc.latitude : null;
+            longitude = typeof loc.longitude === 'number' ? loc.longitude : null;
+          } else if ((info as any).exif) {
+            const gps = extractGpsFromExif((info as any).exif);
+            latitude = gps.latitude;
+            longitude = gps.longitude;
+          }
+          creationTime = (info as any).creationTime ?? null;
+        } catch { }
+      }
+
+      if ((latitude == null || longitude == null) && (a as any).exif) {
+        const gps = extractGpsFromExif((a as any).exif as Record<string, any>);
+        latitude = gps.latitude;
+        longitude = gps.longitude;
+      }
+
+      const fallbackCreation = (a as any).creationTime ?? Date.now();
+      return {
+        id: a.assetId ?? a.uri,
+        uri: a.uri,
+        mediaType: a.type ?? 'image',
+        filename: (a as any).fileName ?? null,
+        creationTime: creationTime ?? fallbackCreation,
+        latitude,
+        longitude,
+        tripId: selectedTripId,
+      } as MediaItem;
+    }));
+
+    // First, remove these media items from any existing trips
+    enriched.forEach(mediaItem => {
+      trips.forEach(trip => {
+        if (trip.mediaIds.includes(mediaItem.id)) {
+          removeMediaFromTrip(trip.id, mediaItem.id);
+        }
+      });
+    });
+
+    // Then add them to the new trip
+    upsertMany(enriched.map(e => ({ ...e, tripId: selectedTripId })));
+    addMediaToTrip(selectedTripId, enriched.map((e) => e.id));
+  }, [selectedTripId, trips, removeMediaFromTrip, upsertMany, addMediaToTrip]);
+
+  const removePhotoFromTrip = useCallback((mediaId: string) => {
+    if (!selectedTripId) return;
+    // Remove from trip
+    removeMediaFromTrip(selectedTripId, mediaId);
+    // Remove from media store completely
+    removeMedia(mediaId);
+    // Force cluster update
+    setClusterUpdateKey(prev => prev + 1);
+  }, [selectedTripId, removeMediaFromTrip, removeMedia]);
+
+  const handleDeleteTrip = useCallback(() => {
+    if (!selectedTripId) return;
+
+    Alert.alert(
+      'Delete Trip',
+      'Are you sure you want to delete this trip? This action cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => {
+            // Remove all media from this trip
+            const tripMedia = media.filter(m => selectedTrip?.mediaIds.includes(m.id));
+            tripMedia.forEach(item => removeMedia(item.id));
+            // Delete the trip
+            deleteTrip(selectedTripId);
+            // Force polyline and cluster updates
+            setPolylineUpdateKey(prev => prev + 1);
+            setClusterUpdateKey(prev => prev + 1);
+            // Close modal and clear selection
+            setShowTripEdit(false);
+            setSelectedTripId(null);
+          }
+        }
+      ]
+    );
+  }, [selectedTripId, selectedTrip, media, removeMedia, deleteTrip]);
 
   return (
     <View style={styles.container}>
@@ -191,7 +499,7 @@ export default function HomeScreen() {
                 onPress={() => openDiaporama(c.id as string)}
               >
                 <View style={styles.clusterContainer}>
-                  <View style={styles.clusterBadge}>
+                  <View style={dynamicStyles.clusterBadge}>
                     <Text style={styles.clusterBadgeText}>{c.count}</Text>
                   </View>
                   <View style={styles.photoMarker}>
@@ -222,9 +530,11 @@ export default function HomeScreen() {
           }
           const p = c.media!;
           return (
-            <Marker key={p.id} coordinate={{ latitude: p.latitude as number, longitude: p.longitude as number }} onPress={() => {
-              if (p.tripId) setSelectedTripId(p.tripId);
-            }}>
+            <Marker
+              key={p.id}
+              coordinate={{ latitude: p.latitude as number, longitude: p.longitude as number }}
+              onPress={() => openDiaporamaForMedia(p)}
+            >
               <View style={styles.photoMarker}>
                 <Image
                   source={{ uri: p.uri }}
@@ -237,42 +547,121 @@ export default function HomeScreen() {
             </Marker>
           );
         })}
+
+        {/* Trip Polylines */}
+        {tripPolylines.map((polyline, index) => (
+          <Polyline
+            key={`polyline-${polyline.tripId}-${polylineUpdateKey}-${polyline.coordinates.length}-${index}`}
+            coordinates={polyline.coordinates}
+            strokeColor={selectedTrip ? theme.colors.primary : theme.colors.primaryLight}
+            strokeWidth={selectedTrip ? 3 : 2}
+            lineDashPattern={[5, 5]}
+          />
+        ))}
       </MapView>
       {selectedTrip && (
         <View style={styles.tripHeader} pointerEvents="box-none">
-          <View style={styles.tripHeaderInner}>
-            <Text style={styles.tripTitle}>{selectedTrip.name}</Text>
-            {selectedTripDates && (
-              <Text style={styles.tripSubtitle}>
-                {selectedTripDates.start.toLocaleDateString()} – {selectedTripDates.end.toLocaleDateString()}
-              </Text>
-            )}
-          </View>
+          {isGlassAvailable ? (
+            <GlassView
+              style={styles.tripHeaderInner}
+              glassEffectStyle="regular"
+              isInteractive={true}
+            >
+              <Text style={[styles.tripTitle, { color: textColor }]}>{selectedTrip.name}</Text>
+              {selectedTripDates && (
+                <Text style={[styles.tripSubtitle, { color: secondaryTextColor }]}>
+                  {selectedTripDates.start.toLocaleDateString()} – {selectedTripDates.end.toLocaleDateString()}
+                </Text>
+              )}
+            </GlassView>
+          ) : (
+            <View style={[styles.tripHeaderInner, { backgroundColor: headerBackgroundColor }]}>
+              <Text style={[styles.tripTitle, { color: textColor }]}>{selectedTrip.name}</Text>
+              {selectedTripDates && (
+                <Text style={[styles.tripSubtitle, { color: secondaryTextColor }]}>
+                  {selectedTripDates.start.toLocaleDateString()} – {selectedTripDates.end.toLocaleDateString()}
+                </Text>
+              )}
+            </View>
+          )}
           <View style={styles.tripActions}>
-            <Pressable style={styles.tripEditBtn} onPress={() => router.push(`/trip/${selectedTrip.id}`)}>
-              <Text style={styles.tripEditText}>Edit</Text>
-            </Pressable>
-            <Pressable style={styles.tripClearBtn} onPress={() => setSelectedTripId(null)}>
-              <Text style={styles.tripClearText}>Show All</Text>
-            </Pressable>
+            {isGlassAvailable ? (
+              <GlassView
+                style={dynamicStyles.tripEditBtn}
+                glassEffectStyle="regular"
+                isInteractive={true}
+              >
+                <Pressable onPress={openTripEdit} style={styles.tripEditPressable}>
+                  <Text style={styles.tripEditText}>Edit</Text>
+                </Pressable>
+              </GlassView>
+            ) : (
+              <Pressable style={dynamicStyles.tripEditBtn} onPress={openTripEdit}>
+                <Text style={styles.tripEditText}>Edit</Text>
+              </Pressable>
+            )}
+            {isGlassAvailable ? (
+              <GlassView
+                style={dynamicStyles.tripClearBtn}
+                glassEffectStyle="regular"
+                isInteractive={true}
+              >
+                <Pressable onPress={() => setSelectedTripId(null)} style={styles.tripClearPressable}>
+                  <Text style={styles.tripClearText}>Show All</Text>
+                </Pressable>
+              </GlassView>
+            ) : (
+              <Pressable style={dynamicStyles.tripClearBtn} onPress={() => setSelectedTripId(null)}>
+                <Text style={styles.tripClearText}>Show All</Text>
+              </Pressable>
+            )}
           </View>
         </View>
       )}
       {/* Toggle Buttons */}
-      <View style={styles.toggleContainer}>
-        <Pressable style={[styles.toggleBtn, !showListView && styles.toggleBtnActive]} onPress={closeListView}>
-          <Text style={[styles.toggleText, !showListView && styles.toggleTextActive]}>Map</Text>
-        </Pressable>
-        <Pressable style={[styles.toggleBtn, showListView && styles.toggleBtnActive]} onPress={openListView}>
-          <Text style={[styles.toggleText, showListView && styles.toggleTextActive]}>List</Text>
-        </Pressable>
-      </View>
+      {isGlassAvailable ? (
+        <GlassView
+          style={styles.toggleContainer}
+          glassEffectStyle="regular"
+          isInteractive={true}
+        >
+          <Pressable style={[styles.toggleBtn, !showListView && styles.toggleBtnActive]} onPress={closeListView}>
+            <Text style={[styles.toggleText, !showListView && styles.toggleTextActive, { color: !showListView ? 'white' : secondaryTextColor }]}>Map</Text>
+          </Pressable>
+          <Pressable style={[styles.toggleBtn, showListView && styles.toggleBtnActive]} onPress={openListView}>
+            <Text style={[styles.toggleText, showListView && styles.toggleTextActive, { color: showListView ? 'white' : secondaryTextColor }]}>Trips</Text>
+          </Pressable>
+        </GlassView>
+      ) : (
+        <View style={[styles.toggleContainer, { backgroundColor: toggleBackgroundColor }]}>
+          <Pressable style={[styles.toggleBtn, !showListView && styles.toggleBtnActive]} onPress={closeListView}>
+            <Text style={[styles.toggleText, !showListView && styles.toggleTextActive, { color: !showListView ? 'white' : secondaryTextColor }]}>Map</Text>
+          </Pressable>
+          <Pressable style={[styles.toggleBtn, showListView && styles.toggleBtnActive]} onPress={openListView}>
+            <Text style={[styles.toggleText, showListView && styles.toggleTextActive, { color: showListView ? 'white' : secondaryTextColor }]}>Trips</Text>
+          </Pressable>
+        </View>
+      )}
 
-      <Link href="/modal" asChild>
-        <Pressable style={styles.fab}>
-          <Text style={styles.fabText}>Add Trip</Text>
-        </Pressable>
-      </Link>
+      {isGlassAvailable ? (
+        <GlassView
+          style={styles.fab}
+          glassEffectStyle="regular"
+          isInteractive={true}
+        >
+          <Link href="/modal" asChild>
+            <Pressable style={styles.fabPressable}>
+              <Text style={styles.fabText}>Add Trip</Text>
+            </Pressable>
+          </Link>
+        </GlassView>
+      ) : (
+        <Link href="/modal" asChild>
+          <Pressable style={styles.fab}>
+            <Text style={styles.fabText}>Add Trip</Text>
+          </Pressable>
+        </Link>
+      )}
 
       {/* List View Modal */}
       <Modal
@@ -284,74 +673,155 @@ export default function HomeScreen() {
         <View style={styles.modalOverlay}>
           <Pressable style={styles.modalBackdrop} onPress={closeListView} />
           <Animated.View style={[styles.listModal, { transform: [{ translateX: slideAnim }] }]}>
-            <View style={styles.listHeader}>
-              <View>
-                <Text style={styles.listTitle}>
-                  {selectedTripId ? `Photos from ${selectedTrip?.name}` : 'Your Trips'}
-                </Text>
-                {selectedTripId && (
-                  <Text style={styles.listSubtitle}>
-                    Showing only photos from this trip
-                  </Text>
-                )}
-              </View>
-              <Pressable onPress={closeListView} style={styles.closeBtn}>
-                <Text style={styles.closeText}>×</Text>
-              </Pressable>
-            </View>
-            <FlatList
-              data={trips}
-              keyExtractor={(item) => item.id}
-              renderItem={({ item: trip }) => {
-                const tripMedia = media.filter(m => trip.mediaIds.includes(m.id));
-
-                // Calculate trip dates
-                const times = tripMedia.map(m => m.creationTime ?? 0).filter(Boolean).sort((a, b) => a - b);
-                const tripDates = times.length > 0 ? {
-                  start: new Date(times[0]),
-                  end: new Date(times[times.length - 1])
-                } : null;
-
-                const firstPhoto = tripMedia.find(m => m.uri);
-
-                return (
-                  <Pressable
-                    style={[
-                      styles.tripCard,
-                      selectedTripId === trip.id && styles.tripCardSelected
-                    ]}
-                    onPress={() => selectTripFromList(trip.id)}
-                  >
-                    <View style={styles.tripCardContent}>
-                      <View style={styles.tripImageContainer}>
-                        {firstPhoto ? (
-                          <Image
-                            source={{ uri: firstPhoto.uri }}
-                            style={styles.tripImage}
-                            contentFit="cover"
-                            cachePolicy="memory-disk"
-                          />
-                        ) : (
-                          <View style={[styles.tripImage, styles.tripImagePlaceholder]}>
-                            <Text style={styles.placeholderText}>📷</Text>
-                          </View>
-                        )}
-                      </View>
-                      <View style={styles.tripInfo}>
-                        <Text style={styles.tripName}>{trip.name}</Text>
-                        {tripDates && (
-                          <Text style={styles.tripDate}>
-                            {tripDates.start.toLocaleDateString()} – {tripDates.end.toLocaleDateString()}
-                          </Text>
-                        )}
-                        <Text style={styles.tripCount}>{tripMedia.length} photos</Text>
-                      </View>
-                    </View>
+            {isGlassAvailable ? (
+              <GlassView
+                style={[styles.listModal, { backgroundColor: 'transparent' }]}
+                glassEffectStyle="regular"
+                isInteractive={true}
+              >
+                <View style={[styles.listHeader, { borderBottomColor: borderColor }]}>
+                  <View>
+                    <Text style={[styles.listTitle, { color: textColor }]}>
+                      {selectedTripId ? `Photos from ${selectedTrip?.name}` : 'Your Trips'}
+                    </Text>
+                    {selectedTripId && (
+                      <Text style={[styles.listSubtitle, { color: secondaryTextColor }]}>
+                        Showing only photos from this trip
+                      </Text>
+                    )}
+                  </View>
+                  <Pressable onPress={closeListView} style={[styles.closeBtn, { backgroundColor: theme.colors.backgroundTertiary }]}>
+                    <Text style={[styles.closeText, { color: secondaryTextColor }]}>×</Text>
                   </Pressable>
-                );
-              }}
-              contentContainerStyle={styles.listContent}
-            />
+                </View>
+                <FlatList
+                  data={trips}
+                  keyExtractor={(item) => item.id}
+                  renderItem={({ item: trip }) => {
+                    const tripMedia = media.filter(m => trip.mediaIds.includes(m.id));
+
+                    // Calculate trip dates
+                    const times = tripMedia.map(m => m.creationTime ?? 0).filter(Boolean).sort((a, b) => a - b);
+                    const tripDates = times.length > 0 ? {
+                      start: new Date(times[0]),
+                      end: new Date(times[times.length - 1])
+                    } : null;
+
+                    const firstPhoto = tripMedia.find(m => m.uri);
+
+                    return (
+                      <Pressable
+                        style={[
+                          styles.tripCard,
+                          { backgroundColor: selectedTripId === trip.id ? selectedCardBackgroundColor : cardBackgroundColor },
+                          selectedTripId === trip.id && dynamicStyles.tripCardSelected
+                        ]}
+                        onPress={() => selectTripFromList(trip.id)}
+                      >
+                        <View style={styles.tripCardContent}>
+                          <View style={styles.tripImageContainer}>
+                            {firstPhoto ? (
+                              <Image
+                                source={{ uri: firstPhoto.uri }}
+                                style={styles.tripImage}
+                                contentFit="cover"
+                                cachePolicy="memory-disk"
+                              />
+                            ) : (
+                              <View style={[styles.tripImage, styles.tripImagePlaceholder, { backgroundColor: theme.colors.backgroundTertiary }]}>
+                                <Text style={styles.placeholderText}>📷</Text>
+                              </View>
+                            )}
+                          </View>
+                          <View style={styles.tripInfo}>
+                            <Text style={[styles.tripName, { color: textColor }]}>{trip.name}</Text>
+                            {tripDates && (
+                              <Text style={[styles.tripDate, { color: secondaryTextColor }]}>
+                                {tripDates.start.toLocaleDateString()} – {tripDates.end.toLocaleDateString()}
+                              </Text>
+                            )}
+                            <Text style={dynamicStyles.tripCount}>{tripMedia.length} photos</Text>
+                          </View>
+                        </View>
+                      </Pressable>
+                    );
+                  }}
+                  contentContainerStyle={styles.listContent}
+                />
+              </GlassView>
+            ) : (
+              <View style={[styles.listModal, { backgroundColor }]}>
+                <View style={[styles.listHeader, { borderBottomColor: borderColor }]}>
+                  <View>
+                    <Text style={[styles.listTitle, { color: textColor }]}>
+                      {selectedTripId ? `Photos from ${selectedTrip?.name}` : 'Your Trips'}
+                    </Text>
+                    {selectedTripId && (
+                      <Text style={[styles.listSubtitle, { color: secondaryTextColor }]}>
+                        Showing only photos from this trip
+                      </Text>
+                    )}
+                  </View>
+                  <Pressable onPress={closeListView} style={[styles.closeBtn, { backgroundColor: theme.colors.backgroundTertiary }]}>
+                    <Text style={[styles.closeText, { color: secondaryTextColor }]}>×</Text>
+                  </Pressable>
+                </View>
+                <FlatList
+                  data={trips}
+                  keyExtractor={(item) => item.id}
+                  renderItem={({ item: trip }) => {
+                    const tripMedia = media.filter(m => trip.mediaIds.includes(m.id));
+
+                    // Calculate trip dates
+                    const times = tripMedia.map(m => m.creationTime ?? 0).filter(Boolean).sort((a, b) => a - b);
+                    const tripDates = times.length > 0 ? {
+                      start: new Date(times[0]),
+                      end: new Date(times[times.length - 1])
+                    } : null;
+
+                    const firstPhoto = tripMedia.find(m => m.uri);
+
+                    return (
+                      <Pressable
+                        style={[
+                          styles.tripCard,
+                          { backgroundColor: selectedTripId === trip.id ? selectedCardBackgroundColor : cardBackgroundColor },
+                          selectedTripId === trip.id && dynamicStyles.tripCardSelected
+                        ]}
+                        onPress={() => selectTripFromList(trip.id)}
+                      >
+                        <View style={styles.tripCardContent}>
+                          <View style={styles.tripImageContainer}>
+                            {firstPhoto ? (
+                              <Image
+                                source={{ uri: firstPhoto.uri }}
+                                style={styles.tripImage}
+                                contentFit="cover"
+                                cachePolicy="memory-disk"
+                              />
+                            ) : (
+                              <View style={[styles.tripImage, styles.tripImagePlaceholder, { backgroundColor: theme.colors.backgroundTertiary }]}>
+                                <Text style={styles.placeholderText}>📷</Text>
+                              </View>
+                            )}
+                          </View>
+                          <View style={styles.tripInfo}>
+                            <Text style={[styles.tripName, { color: textColor }]}>{trip.name}</Text>
+                            {tripDates && (
+                              <Text style={[styles.tripDate, { color: secondaryTextColor }]}>
+                                {tripDates.start.toLocaleDateString()} – {tripDates.end.toLocaleDateString()}
+                              </Text>
+                            )}
+                            <Text style={dynamicStyles.tripCount}>{tripMedia.length} photos</Text>
+                          </View>
+                        </View>
+                      </Pressable>
+                    );
+                  }}
+                  contentContainerStyle={styles.listContent}
+                />
+              </View>
+            )}
           </Animated.View>
         </View>
       </Modal>
@@ -362,6 +832,122 @@ export default function HomeScreen() {
         onClose={closeDiaporama}
         media={diaporamaMedia}
       />
+
+      {/* Trip Edit Modal */}
+      <Modal
+        visible={showTripEdit}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={closeTripEdit}
+      >
+        <View style={styles.modalOverlay}>
+          {selectedTrip && (
+            <>
+              {isGlassAvailable ? (
+                <GlassView
+                  style={styles.tripEditModal}
+                  glassEffectStyle="regular"
+                  isInteractive={true}
+                >
+                  <View style={styles.tripEditHeader}>
+                    <View>
+                      <Text style={[styles.tripEditTitle, { color: textColor }]}>{selectedTrip.name}</Text>
+                      {selectedTripDates && (
+                        <Text style={[styles.tripEditSubtitle, { color: secondaryTextColor }]}>
+                          {selectedTripDates.start.toLocaleDateString()} – {selectedTripDates.end.toLocaleDateString()}
+                        </Text>
+                      )}
+                    </View>
+                    <Pressable onPress={closeTripEdit} style={styles.tripEditCloseBtn}>
+                      <Text style={[styles.tripEditCloseText, { color: textColor }]}>×</Text>
+                    </Pressable>
+                  </View>
+
+                  <View style={styles.tripEditActions}>
+                    <GlassView
+                      style={[styles.tripEditActionBtn, dynamicStyles.primary]}
+                      glassEffectStyle="regular"
+                      isInteractive={true}
+                    >
+                      <Pressable onPress={addPhotosToTrip} style={styles.tripEditActionPressable}>
+                        <Text style={styles.primaryText}>Add Photos</Text>
+                      </Pressable>
+                    </GlassView>
+
+                    <GlassView
+                      style={[styles.tripEditActionBtn, dynamicStyles.danger]}
+                      glassEffectStyle="regular"
+                      isInteractive={true}
+                    >
+                      <Pressable onPress={handleDeleteTrip} style={styles.tripEditActionPressable}>
+                        <Text style={styles.dangerText}>Delete Trip</Text>
+                      </Pressable>
+                    </GlassView>
+                  </View>
+
+                  <FlatList
+                    data={media.filter(m => selectedTrip.mediaIds.includes(m.id))}
+                    keyExtractor={(i) => i.id}
+                    numColumns={3}
+                    columnWrapperStyle={{ gap: 8 }}
+                    contentContainerStyle={{ gap: 8, padding: 12 }}
+                    renderItem={({ item }) => (
+                      <View style={dynamicStyles.tripEditGridItem}>
+                        <Image source={{ uri: item.uri }} style={styles.tripEditGridPhoto} contentFit="cover" />
+                        <Pressable onPress={() => removePhotoFromTrip(item.id)} style={styles.tripEditRemoveBadge}>
+                          <Text style={styles.tripEditRemoveText}>×</Text>
+                        </Pressable>
+                      </View>
+                    )}
+                  />
+                </GlassView>
+              ) : (
+                <View style={[styles.tripEditModal, { backgroundColor }]}>
+                  <View style={styles.tripEditHeader}>
+                    <View>
+                      <Text style={[styles.tripEditTitle, { color: textColor }]}>{selectedTrip.name}</Text>
+                      {selectedTripDates && (
+                        <Text style={[styles.tripEditSubtitle, { color: secondaryTextColor }]}>
+                          {selectedTripDates.start.toLocaleDateString()} – {selectedTripDates.end.toLocaleDateString()}
+                        </Text>
+                      )}
+                    </View>
+                    <Pressable onPress={closeTripEdit} style={styles.tripEditCloseBtn}>
+                      <Text style={[styles.tripEditCloseText, { color: textColor }]}>×</Text>
+                    </Pressable>
+                  </View>
+
+                  <View style={styles.tripEditActions}>
+                    <Pressable onPress={addPhotosToTrip} style={[styles.tripEditActionBtn, dynamicStyles.primary]}>
+                      <Text style={styles.primaryText}>Add Photos</Text>
+                    </Pressable>
+
+                    <Pressable onPress={handleDeleteTrip} style={[styles.tripEditActionBtn, dynamicStyles.danger]}>
+                      <Text style={styles.dangerText}>Delete Trip</Text>
+                    </Pressable>
+                  </View>
+
+                  <FlatList
+                    data={media.filter(m => selectedTrip.mediaIds.includes(m.id))}
+                    keyExtractor={(i) => i.id}
+                    numColumns={3}
+                    columnWrapperStyle={{ gap: 8 }}
+                    contentContainerStyle={{ gap: 8, padding: 12 }}
+                    renderItem={({ item }) => (
+                      <View style={dynamicStyles.tripEditGridItem}>
+                        <Image source={{ uri: item.uri }} style={styles.tripEditGridPhoto} contentFit="cover" />
+                        <Pressable onPress={() => removePhotoFromTrip(item.id)} style={styles.tripEditRemoveBadge}>
+                          <Text style={styles.tripEditRemoveText}>×</Text>
+                        </Pressable>
+                      </View>
+                    )}
+                  />
+                </View>
+              )}
+            </>
+          )}
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -412,10 +998,14 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
     shadowOffset: { width: 0, height: 2 },
   },
+  fabPressable: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   fabText: { color: 'white', fontWeight: '700' },
   tripHeader: {
     position: 'absolute',
-    top: 12,
+    top: 100,
     left: 12,
     right: 12,
     flexDirection: 'row',
@@ -426,31 +1016,33 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 8,
     borderRadius: 10,
-    backgroundColor: 'rgba(255,255,255,0.95)',
   },
   tripTitle: { fontWeight: '700', fontSize: 16 },
-  tripSubtitle: { color: '#666', marginTop: 2 },
+  tripSubtitle: { marginTop: 2 },
   tripActions: {
     flexDirection: 'row',
     gap: 8,
   },
   tripEditBtn: { backgroundColor: '#1e88e5', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10 },
+  tripEditPressable: { borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
   tripEditText: { color: 'white', fontWeight: '700' },
   tripClearBtn: { backgroundColor: '#666', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10 },
+  tripClearPressable: { borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
   tripClearText: { color: 'white', fontWeight: '700' },
   // Toggle buttons
   toggleContainer: {
     position: 'absolute',
-    top: 32,
+    top: 60,
     left: 16,
     flexDirection: 'row',
-    backgroundColor: 'rgba(255,255,255,0.95)',
     borderRadius: 8,
     overflow: 'hidden',
     shadowColor: '#000',
     shadowOpacity: 0.1,
     shadowRadius: 4,
     shadowOffset: { width: 0, height: 2 },
+    paddingHorizontal: 0,
+    paddingVertical: 0,
   },
   toggleBtn: {
     paddingHorizontal: 16,
@@ -458,12 +1050,10 @@ const styles = StyleSheet.create({
     backgroundColor: 'transparent',
   },
   toggleBtnActive: {
-    backgroundColor: '#1e88e5',
   },
   toggleText: {
     fontSize: 14,
     fontWeight: '600',
-    color: '#666',
   },
   toggleTextActive: {
     color: 'white',
@@ -480,7 +1070,6 @@ const styles = StyleSheet.create({
   },
   listModal: {
     width: 300,
-    backgroundColor: 'white',
     shadowColor: '#000',
     shadowOpacity: 0.25,
     shadowRadius: 10,
@@ -496,8 +1085,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: 16,
     paddingVertical: 16,
+    paddingTop: 60,
     borderBottomWidth: 1,
-    borderBottomColor: '#eee',
   },
   listTitle: {
     fontSize: 18,
@@ -505,21 +1094,18 @@ const styles = StyleSheet.create({
   },
   listSubtitle: {
     fontSize: 12,
-    color: '#666',
     marginTop: 2,
   },
   closeBtn: {
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: '#f0f0f0',
     alignItems: 'center',
     justifyContent: 'center',
   },
   closeText: {
     fontSize: 18,
     fontWeight: '700',
-    color: '#666',
   },
   listContent: {
     padding: 16,
@@ -527,7 +1113,6 @@ const styles = StyleSheet.create({
   tripCard: {
     marginBottom: 12,
     borderRadius: 12,
-    backgroundColor: '#f8f9fa',
     overflow: 'hidden',
     shadowColor: '#000',
     shadowOpacity: 0.1,
@@ -535,7 +1120,6 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
   },
   tripCardSelected: {
-    backgroundColor: '#e3f2fd',
     borderWidth: 2,
     borderColor: '#1e88e5',
   },
@@ -555,7 +1139,6 @@ const styles = StyleSheet.create({
     height: '100%',
   },
   tripImagePlaceholder: {
-    backgroundColor: '#e0e0e0',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -573,12 +1156,102 @@ const styles = StyleSheet.create({
   },
   tripDate: {
     fontSize: 12,
-    color: '#666',
     marginBottom: 2,
   },
   tripCount: {
     fontSize: 12,
     color: '#1e88e5',
     fontWeight: '600',
+  },
+  // Trip edit modal
+  tripEditModal: {
+    position: 'absolute',
+    top: 100,
+    left: 20,
+    right: 20,
+    bottom: 100,
+    borderRadius: 16,
+    overflow: 'hidden',
+  },
+  tripEditHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    paddingTop: 20,
+  },
+  tripEditTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+  },
+  tripEditSubtitle: {
+    fontSize: 14,
+    marginTop: 4,
+  },
+  tripEditCloseBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(0,0,0,0.1)',
+  },
+  tripEditCloseText: {
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  tripEditActions: {
+    flexDirection: 'row',
+    gap: 12,
+    paddingHorizontal: 20,
+    paddingBottom: 16,
+  },
+  tripEditActionBtn: {
+    flex: 1,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  tripEditActionPressable: {
+    width: '100%',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  primary: { backgroundColor: '#1e88e5' },
+  primaryText: { color: 'white', fontWeight: '700' },
+  danger: { backgroundColor: '#ff4444' },
+  dangerText: { color: 'white', fontWeight: '700' },
+  tripEditGridItem: {
+    position: 'relative',
+    width: '32%',
+    aspectRatio: 1,
+    borderRadius: 8,
+    overflow: 'hidden',
+    backgroundColor: '#f2f2f2',
+  },
+  tripEditGridPhoto: {
+    width: '100%',
+    height: '100%',
+  },
+  tripEditRemoveBadge: {
+    position: 'absolute',
+    top: 6,
+    right: 6,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  tripEditRemoveText: {
+    color: 'white',
+    fontWeight: '700',
   },
 });

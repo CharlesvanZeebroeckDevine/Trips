@@ -12,6 +12,7 @@ type TripStore = {
     addTrip: (trip: Trip) => void;
     addMediaToTrip: (tripId: string, mediaIds: string[]) => void;
     removeMediaFromTrip: (tripId: string, mediaId: string) => void;
+    deleteTrip: (tripId: string) => void;
 };
 
 export const useTripStore = create<TripStore>((set, get) => ({
@@ -27,6 +28,11 @@ export const useTripStore = create<TripStore>((set, get) => ({
     removeMediaFromTrip: (tripId, mediaId) => {
         set({
             trips: get().trips.map((t) => t.id === tripId ? { ...t, mediaIds: t.mediaIds.filter((id) => id !== mediaId) } : t),
+        });
+    },
+    deleteTrip: (tripId) => {
+        set({
+            trips: get().trips.filter((t) => t.id !== tripId),
         });
     },
 }));

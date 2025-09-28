@@ -4,6 +4,7 @@ import type { MediaItem } from '@/components/types';
 type MediaStore = {
     items: MediaItem[];
     upsertMany: (newItems: MediaItem[]) => void;
+    removeMedia: (mediaId: string) => void;
     clear: () => void;
 };
 
@@ -18,6 +19,11 @@ export const useMediaStore = create<MediaStore>((set, get) => ({
             byId.set(it.id, { ...prev, ...it });
         }
         set({ items: Array.from(byId.values()) });
+    },
+    removeMedia: (mediaId: string) => {
+        set({
+            items: get().items.filter((item) => item.id !== mediaId),
+        });
     },
     clear: () => set({ items: [] }),
 }));
